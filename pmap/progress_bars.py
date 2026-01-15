@@ -56,6 +56,7 @@ class ParallelMode:
     log_queue: Any  # multiprocessing.Queue | None
     wrapped_func: Callable
     stripped_names: set[str]
+    manager: Any = None  # multiprocessing.Manager | None
 
 
 def prepare_parallel_mode(f: Callable, prefer: str | None) -> ParallelMode:
@@ -67,19 +68,22 @@ def prepare_parallel_mode(f: Callable, prefer: str | None) -> ParallelMode:
             using_threads=True,
             log_queue=None,
             wrapped_func=f,
-            stripped_names=set()
+            stripped_names=set(),
+            manager=None
         )
 
     stripped_names = find_loguru_names(f)
     strip_loguru_from_globals(f, stripped_names)
-    log_queue = multiprocessing.Manager().Queue()
+    manager = multiprocessing.Manager()
+    log_queue = manager.Queue()
     config = LoguruConfig(stripped_names, log_queue)
 
     return ParallelMode(
         using_threads=False,
         log_queue=log_queue,
         wrapped_func=make_worker_wrapper(f, config),
-        stripped_names=stripped_names
+        stripped_names=stripped_names,
+        manager=manager
     )
 
 

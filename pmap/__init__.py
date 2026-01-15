@@ -102,6 +102,8 @@ def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, ba
     finally:
         if mode.stripped_names:
             reinject_loguru(f, mode.stripped_names)
+        if mode.manager is not None:
+            mode.manager.shutdown()
 
     return results
 
@@ -153,7 +155,7 @@ def run_async(func):
         print(f'Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds')
 
     def wrapper(*args, **kwargs):
-        queue = multiprocessing.Manager().Queue()
+        queue = multiprocessing.Queue()
         process = multiprocessing.Process(target=func_with_queue, args=(queue, *args), kwargs=kwargs)
         process.start()
         return queue
