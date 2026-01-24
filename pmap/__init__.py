@@ -5,6 +5,7 @@ Usage:
 
     results = pmap(fn, items)  # Simple progress bar
     results = pmap(fn, items, show_job_bars=True)  # Per-job progress bars
+    results = pmap(fn, items, backend='tqdm')  # Force tqdm backend
 """
 from __future__ import annotations
 
@@ -26,6 +27,15 @@ from .progress_bars import (
 )
 
 __all__ = ['pmap', 'pmap_df', 'run_async', 'safe']
+
+
+def is_notebook() -> bool:
+    """Detect if running in Jupyter notebook."""
+    try:
+        shell = get_ipython().__class__.__name__  # type: ignore
+        return shell == 'ZMQInteractiveShell'
+    except NameError:
+        return False
 
 warnings.filterwarnings(
     "ignore",
@@ -49,7 +59,7 @@ def safe(f: Callable) -> Callable:
     return wrapper
 
 
-def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, batch_size='auto', show_job_bars=False, **kwargs):
+def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, batch_size='auto', show_job_bars=False, backend='auto', **kwargs):
     """Parallel map with progress bar.
 
     Args:
@@ -61,6 +71,8 @@ def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, ba
         spawn: Use spawn multiprocessing start method
         batch_size: Joblib batch size ('auto' or int)
         show_job_bars: Show per-job progress bars with CPU info (default: False)
+        backend: 'auto' (default), 'rich', or 'tqdm'
+                 'auto' uses tqdm in notebooks (Rich doesn't support notebooks)
         **kwargs: Additional arguments passed to joblib.Parallel
             - desc: Description for progress bar (default: 'Processing')
             - prefer: 'threads' for threading backend
@@ -73,6 +85,18 @@ def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, ba
           loguru and appears above the progress bar in real-time
         - In thread mode, output goes directly to stdout (shared between threads)
     """
+    # Auto-select backend: tqdm for notebooks (Rich Live doesn't work), rich otherwise
+    if backend == 'auto':
+        backend = 'tqdm' if is_notebook() else 'rich'
+
+    # Use tqdm backend
+    if backend == 'tqdm':
+        from .tqdm_backend import pmap as tqdm_pmap
+        return tqdm_pmap(f, arr, n_jobs=n_jobs, disable_tqdm=disable_tqdm,
+                         safe_mode=safe_mode, spawn=spawn, batch_size=batch_size,
+                         show_job_bars=show_job_bars, **kwargs)
+
+    # Rich backend (default for terminal)
     arr = list(arr)
     desc = kwargs.pop('desc', 'Processing')
     total_tasks = len(arr)
