@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import multiprocessing
-from typing import Callable
 
+from .. import safe
 from ..loguru_routing import reinject_loguru
 from .progress import (
     prepare_parallel_mode,
@@ -13,17 +13,6 @@ from .progress import (
 )
 
 __all__ = ['pmap', 'safe']
-
-
-def safe(f: Callable) -> Callable:
-    """Wrap function to catch exceptions and return error dict."""
-    def wrapper(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            return {'error': str(e), 'error_type': type(e).__name__,
-                    'args': args, 'kwargs': kwargs}
-    return wrapper
 
 
 def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False,
