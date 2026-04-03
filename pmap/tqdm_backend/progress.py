@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import contextlib
-import multiprocessing
 import re
 import sys
 import threading
-from dataclasses import dataclass
 from typing import Any, Callable
 import queue as queue_module
 
@@ -14,32 +12,120 @@ import joblib
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
-# ANSI escape code pattern
+from .. import is_notebook
+from ..core import ParallelMode, joblib_callback_patch
+
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
-
-from .. import is_notebook
+# Map ANSI color codes to CSS colors
+_ANSI_COLORS = {
+    '30': 'black', '31': 'red', '32': 'green', '33': 'yellow',
+    '34': 'blue', '35': 'magenta', '36': 'cyan', '37': 'white',
+    '90': 'gray', '91': '#ff6b6b', '92': '#69db7c', '93': '#ffd43b',
+    '94': '#74c0fc', '95': '#e599f7', '96': '#66d9e8', '97': 'white',
+}
 
 
 def strip_ansi(text: str) -> str:
-    """Remove ANSI escape codes from text."""
     return ANSI_ESCAPE.sub('', text)
 
 
-class AnsiStrippingStdoutProxy:
-    """Stdout proxy that strips ANSI escape codes before writing.
+_ANSI_STYLES = {
+    '1': 'font-weight:bold',
+    '2': 'opacity:0.7',
+    '3': 'font-style:italic',
+}
 
-    Used in notebook thread/sequential modes where print() and rich.print()
-    write directly to stdout with ANSI codes that render as garbage in Jupyter.
+
+def _parse_ansi_styles(codes: list[str]) -> tuple[list[str], int]:
+    """Parse ANSI codes into CSS styles, returning (styles, reset_count)."""
+    styles = []
+    resets = 0
+    for code in codes:
+        if code in ('0', ''):
+            resets += 1
+        elif code in _ANSI_STYLES:
+            styles.append(_ANSI_STYLES[code])
+        elif code in _ANSI_COLORS:
+            styles.append(f'color:{_ANSI_COLORS[code]}')
+    return styles, resets
+
+
+def ansi_to_html(text: str) -> str:
+    """Convert common ANSI escape codes to HTML spans."""
+    import html as html_mod
+    result = []
+    open_spans = 0
+    i = 0
+    while i < len(text):
+        if text[i] == '\x1b' and i + 1 < len(text) and text[i + 1] == '[':
+            j = i + 2
+            while j < len(text) and text[j] not in 'mGHJK':
+                j += 1
+            if j < len(text) and text[j] == 'm':
+                codes = text[i + 2:j].split(';')
+                styles, resets = _parse_ansi_styles(codes)
+                for _ in range(resets):
+                    result.append('</span>' * open_spans)
+                    open_spans = 0
+                if styles:
+                    result.append(f'<span style="{";".join(styles)}">')
+                    open_spans += 1
+            i = j + 1
+            continue
+        else:
+            result.append(html_mod.escape(text[i]))
+            i += 1
+    result.append('</span>' * open_spans)
+    return ''.join(result)
+
+
+class NotebookStdoutRedirector:
+    """Thread-safe stdout proxy that formats output like loguru for notebooks.
+
+    Uses thread-local buffers so concurrent threads don't interleave.
+    Writes directly to the real stdout (not through loguru) to avoid
+    re-entrancy deadlocks with loguru's internal lock.
     """
     def __init__(self, real_stdout):
         self._real = real_stdout
+        self._local = threading.local()
+        self._lock = threading.Lock()
+
+    def _get_buffer(self) -> str:
+        return getattr(self._local, 'buf', '')
+
+    def _set_buffer(self, value: str) -> None:
+        self._local.buf = value
 
     def write(self, msg: str) -> int:
-        return self._real.write(strip_ansi(msg))
+        if not msg:
+            return 0
+        buf = self._get_buffer() + msg
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            text = strip_ansi(line).strip()
+            if text:
+                from datetime import datetime
+                ts = datetime.now().strftime("%H:%M:%S")
+                formatted = f"{ts} | INFO     | {text}\n"
+                with self._lock:
+                    self._real.write(formatted)
+                    self._real.flush()
+        self._set_buffer(buf)
+        return len(msg)
 
     def flush(self) -> None:
-        self._real.flush()
+        buf = self._get_buffer()
+        text = strip_ansi(buf).strip()
+        if text:
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            formatted = f"{ts} | INFO     | {text}\n"
+            with self._lock:
+                self._real.write(formatted)
+                self._real.flush()
+        self._set_buffer('')
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -47,71 +133,27 @@ class AnsiStrippingStdoutProxy:
 
 @contextlib.contextmanager
 def notebook_stdout_filter():
-    """Strip ANSI from stdout in notebook environments. No-op in terminals."""
+    """Route stdout through loguru in notebooks. No-op in terminals."""
     if not is_notebook():
         yield
         return
     old_stdout = sys.stdout
-    sys.stdout = AnsiStrippingStdoutProxy(old_stdout)
+    sys.stdout = NotebookStdoutRedirector(old_stdout)
     try:
         yield
     finally:
+        sys.stdout.flush()
         sys.stdout = old_stdout
 
 
 def safe_write(pbar, message: str) -> None:
     """Write message compatible with both terminal and notebook."""
     if is_notebook():
-        # In notebook: use print() - logs appear above, widget stays at bottom
-        print(strip_ansi(message))
+        from IPython.display import display, HTML
+        html = ansi_to_html(message)
+        display(HTML(f"<pre style='margin:0;padding:0'>{html}</pre>"))
     else:
-        # In terminal: use tqdm.write() for proper cursor handling
         pbar.write(message)
-
-from ..loguru_routing import (
-    LoguruConfig,
-    find_loguru_names,
-    strip_loguru_from_globals,
-    make_worker_wrapper,
-)
-
-
-@dataclass
-class ParallelMode:
-    """Configuration for parallel execution."""
-    using_threads: bool
-    log_queue: Any  # multiprocessing.Queue | None
-    wrapped_func: Callable
-    stripped_names: set[str]
-    manager: Any = None  # multiprocessing.Manager | None
-
-
-def prepare_parallel_mode(f: Callable, prefer: str | None) -> ParallelMode:
-    """Prepare function for parallel execution."""
-    using_threads = prefer == 'threads'
-
-    if using_threads:
-        return ParallelMode(
-            using_threads=True,
-            log_queue=None,
-            wrapped_func=f,
-            stripped_names=set(),
-        )
-
-    # Process mode: need Manager for pickleable queue
-    stripped_names = find_loguru_names(f)
-    strip_loguru_from_globals(f, stripped_names)
-    manager = multiprocessing.Manager()
-    log_queue = manager.Queue()
-    config = LoguruConfig(stripped_names, log_queue)
-
-    return ParallelMode(
-        using_threads=False,
-        log_queue=log_queue,
-        wrapped_func=make_worker_wrapper(f, config),
-        stripped_names=stripped_names,
-        manager=manager,
-    )
 
 
 def sequential_map(f: Callable, arr: list, desc: str, disable: bool) -> list:
@@ -120,11 +162,10 @@ def sequential_map(f: Callable, arr: list, desc: str, disable: bool) -> list:
         return [f(item) for item in arr]
 
     results = []
-    with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
+    with (notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref):
         pbar = tqdm(arr, desc=desc)
         pbar_ref[0] = pbar
-        for item in pbar:
-            results.append(f(item))
+        results.extend(f(item) for item in pbar)
     return results
 
 
@@ -138,15 +179,18 @@ def redirect_loguru_to_tqdm():
         msg = str(m).rstrip()
         if pbar_ref[0] is not None:
             safe_write(pbar_ref[0], msg)
+        elif in_notebook:
+            from IPython.display import display, HTML
+            display(HTML(f"<pre style='margin:0;padding:0'>{ansi_to_html(msg)}</pre>"))
         else:
-            print(strip_ansi(msg) if in_notebook else msg)
+            print(msg)
 
     try:
         import loguru
         loguru.logger.remove()
         handler_id = loguru.logger.add(
             write_fn,
-            colorize=not in_notebook,  # No colors in notebook
+            colorize=True,
             format="{time:HH:mm:ss} | {level: <8} | {message}"
         )
         try:
@@ -203,11 +247,8 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
             pbar.update(n=self.batch_size)
             return super().__call__(out)
 
-    old_cb = joblib.parallel.BatchCompletionCallBack
-    joblib.parallel.BatchCompletionCallBack = TqdmCallback
-
     try:
-        with log_consumer_tqdm(mode.log_queue, pbar):
+        with joblib_callback_patch(TqdmCallback), log_consumer_tqdm(mode.log_queue, pbar):
             if mode.using_threads:
                 with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
                     pbar_ref[0] = pbar
@@ -219,7 +260,6 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
                     delayed(mode.wrapped_func)(i) for i in arr
                 )
     finally:
-        joblib.parallel.BatchCompletionCallBack = old_cb
         pbar.close()
 
     return results
@@ -229,16 +269,12 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
                       disable_tqdm: bool, desc: str, total_tasks: int,
                       total_cpus: int, kwargs: dict) -> list:
     """Run with per-job tqdm progress bars."""
-    # In notebooks, multi-position bars don't work well - use simple bar
     if is_notebook():
         return run_with_simple_bar(mode, arr, n_jobs, batch_size,
                                    disable_tqdm, desc, kwargs)
 
-    # Overall progress bar at position 0
-    overall = tqdm(total=total_tasks, desc=f"{desc}", position=0,
+    overall = tqdm(total=total_tasks, desc=desc, position=0,
                    disable=disable_tqdm, leave=True)
-
-    # Track active job bars
     active_bars = {}
     bar_lock = threading.Lock()
     job_counter = [0]
@@ -250,13 +286,11 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
                 job_counter[0] += 1
                 job_num = job_counter[0]
 
-                # Clean up old bars (keep max total_cpus active)
                 while len(active_bars) >= total_cpus:
                     oldest = min(active_bars.keys())
                     active_bars[oldest].close()
                     del active_bars[oldest]
 
-                # Add new bar showing job completion
                 pos = (len(active_bars) % total_cpus) + 1
                 bar = tqdm(total=1, desc=f"  Job {job_num:>4}", position=pos,
                           leave=False, disable=disable_tqdm,
@@ -266,11 +300,8 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
 
             return super().__call__(out)
 
-    old_cb = joblib.parallel.BatchCompletionCallBack
-    joblib.parallel.BatchCompletionCallBack = TqdmJobCallback
-
     try:
-        with log_consumer_tqdm(mode.log_queue, overall):
+        with joblib_callback_patch(TqdmJobCallback), log_consumer_tqdm(mode.log_queue, overall):
             if mode.using_threads:
                 with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
                     pbar_ref[0] = overall
@@ -282,12 +313,10 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
                     delayed(mode.wrapped_func)(i) for i in arr
                 )
     finally:
-        joblib.parallel.BatchCompletionCallBack = old_cb
         with bar_lock:
             for bar in active_bars.values():
                 bar.close()
         overall.close()
-        # Clear the extra lines from job bars
         print('\n' * total_cpus, end='')
 
     return results

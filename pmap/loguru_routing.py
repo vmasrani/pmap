@@ -34,29 +34,24 @@ class LoguruStdoutRedirector:
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             if line.strip():
-                try:
+                with contextlib.suppress(Exception):
                     from loguru import logger
                     logger.opt(depth=2).info(line.rstrip())
-                except Exception:
-                    pass
 
     def flush(self) -> None:
         if self._buffer.strip():
-            try:
+            with contextlib.suppress(Exception):
                 from loguru import logger
                 logger.opt(depth=2).info(self._buffer.rstrip())
-            except Exception:
-                pass
             self._buffer = ""
 
 
 def create_queue_sink(log_queue):
     """Create a loguru sink that writes to a multiprocessing queue."""
     def sink(message):
-        try:
+        with contextlib.suppress(Exception):
             log_queue.put_nowait(str(message).rstrip())
-        except Exception:
-            pass
+
     return sink
 
 
@@ -90,53 +85,49 @@ def start_log_consumer(log_queue, live):
 def find_loguru_names(f: Callable) -> set[str]:
     """Find loguru Logger names in function globals without mutating."""
     names: set[str] = set()
-    try:
+    with contextlib.suppress(ImportError):
         from loguru._logger import Logger
-        if hasattr(f, '__globals__'):
-            for name, value in f.__globals__.items():
-                if isinstance(value, Logger):
-                    names.add(name)
-    except ImportError:
-        pass
+        globs: dict[str, Any] = getattr(f, '__globals__', {})
+        for name, value in globs.items():
+            if isinstance(value, Logger):
+                names.add(name)
     return names
 
 
 def strip_loguru_from_globals(f: Callable, names: set[str]) -> None:
     """Remove loguru Logger from function globals to allow pickling."""
-    if not names or not hasattr(f, '__globals__'):
+    globs: dict[str, Any] | None = getattr(f, '__globals__', None)
+    if not names or globs is None:
         return
     for name in names:
-        if name in f.__globals__:
-            f.__globals__[name] = None
+        if name in globs:
+            globs[name] = None
 
 
 def setup_worker_loguru(config: LoguruConfig) -> None:
     """Configure loguru in worker process."""
     if config.log_queue is None:
         return
-    try:
+    with contextlib.suppress(ImportError):
         from loguru import logger
         logger.remove()
         logger.add(
             create_queue_sink(config.log_queue),
             format="{time:HH:mm:ss} | {level: <8} | {message}",
-            colorize=False
+            colorize=True
         )
-    except ImportError:
-        pass
 
 
 def reinject_loguru(f: Callable, stripped_names: set[str]) -> None:
     """Re-inject loguru into function globals after pickle."""
-    if not stripped_names or not hasattr(f, '__globals__'):
+    globs: dict[str, Any] | None = getattr(f, '__globals__', None)
+    if not stripped_names or globs is None:
         return
-    try:
+    with contextlib.suppress(ImportError):
         from loguru import logger
         for name in stripped_names:
-            if f.__globals__.get(name) is None:
-                f.__globals__[name] = logger
-    except ImportError:
-        pass
+            if globs.get(name) is None:
+                globs[name] = logger
 
 
 def make_worker_wrapper(f: Callable, config: LoguruConfig) -> Callable:

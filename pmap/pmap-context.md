@@ -1,27 +1,27 @@
 # pmap
-> Parallel map library wrapping joblib with Rich/tqdm progress bars, loguru routing, and notebook auto-detection.
-`4 files | 2026-04-02`
+> Core package for parallel map with rich/tqdm progress bars, dual-backend design, and loguru-aware process/thread dispatch.
+`7 files | 2026-04-03`
 
 | Entry | Purpose |
 |-------|---------|
-| `__init__.py` | Main public API — `pmap`, `pmap_df`, `run_async`, `safe`; dispatches to rich or tqdm backend |
-| `loguru_routing.py` | Strips loguru from worker globals before pickling, re-injects after; routes worker stdout/logs through a queue so output appears above progress bars |
-| `progress_bars.py` | Rich-based progress bar implementations (simple bar and per-job bars); integrates with joblib via callbacks |
-| `progress_styles.py` | Visual styling helpers for Rich progress columns and job descriptions |
-| **tqdm_backend/** | tqdm-based parallel map backend using joblib under the hood; works in both terminals and Jupyter notebooks. |
+| `__init__.py` | Public API: `pmap`, `pmap_df`, `run_async`, `safe`. Backend selection (`auto`/`rich`/`tqdm`) and notebook detection live here. |
+| `core.py` | Shared orchestration used by both backends — `run_pmap()` entry point, `prepare_parallel_mode()`, and joblib callback patcher. |
+| `progress_bars.py` | Rich backend implementations: simple bar (`run_with_simple_bar`), per-job bars (`run_with_job_bars`), and `sequential_map`. |
+| `loguru_routing.py` | Strips loguru from function globals before pickling, re-injects it in workers, and routes worker print/log output above the progress bar via a queue. |
+| `progress_styles.py` | Rich layout helpers — column definitions and table construction for `show_job_bars` mode. |
+| **tqdm_backend/** | tqdm-based progress rendering for pmap — handles terminal bars, per-job bars, and notebook display via a unified API. |
 
 <!-- peek -->
 
 ## Conventions
-
-- Backend selection is automatic: `backend='auto'` uses `tqdm` in Jupyter notebooks (Rich `Live` does not render in notebooks) and `rich` in terminals. Pass `backend='rich'` or `backend='tqdm'` to override.
-- `prefer='threads'` skips all loguru stripping and queue setup entirely — thread mode uses no log routing because threads share stdout.
-- `pmap_df` splits a DataFrame into `n_chunks` (default 100) before parallel mapping, then `pd.concat`s results — callee function must accept and return a DataFrame slice.
-- `safe_mode=True` wraps `f` with the `safe()` decorator, catching all exceptions and returning `{'error': ..., 'error_type': ..., 'args': ..., 'kwargs': ...}` dicts rather than raising.
+- Backend selection at call site: `backend='auto'` (default) switches to `'tqdm'` in notebooks because Rich's `Live` doesn't render in Jupyter. Override explicitly if needed.
+- `run_pmap()` in `core.py` is backend-agnostic — it accepts `safe_fn`, `sequential_map_fn`, `run_simple_fn`, `run_job_bars_fn` as callables so both backends can reuse the same orchestration logic.
+- Progress bars hook into joblib via monkeypatching `joblib.parallel.BatchCompletionCallBack`. The patch is always restored in a `finally` block.
+- `prefer='threads'` bypasses all loguru stripping/queue setup — thread mode shares stdout directly.
 
 ## Gotchas
-
-- Loguru `logger` objects are not picklable. `loguru_routing.py` mutates `f.__globals__` directly (sets loguru names to `None`) before spawning workers and restores them in a `finally` block via `reinject_loguru`. This mutation is global — if `pmap` is interrupted mid-run, loguru stays `None` in the caller's module until the next successful `pmap` call completes the `finally`.
-- `multiprocessing.Manager()` is started for every process-mode `pmap` call (to create a shared queue). `manager.shutdown()` is called in `finally` — failing to reach `finally` (e.g., `SIGKILL`) leaves a manager process orphaned.
-- `spawn=True` calls `multiprocessing.set_start_method('spawn', force=True)` globally and permanently for the process lifetime, not just for that call.
-- `n_jobs=1` bypasses joblib entirely and runs sequentially with a simple tqdm loop — useful for debugging.
+- Loguru is **stripped from function globals before pickling** and re-injected after. If a worker function closes over a loguru `logger` not in its own module's globals, it won't be found by `find_loguru_names` and will cause a pickling error in process mode. Use `prefer='threads'` as a workaround.
+- `multiprocessing.Manager()` is created for every process-mode call, including when `n_jobs=1` (which short-circuits to `sequential_map` before that point). Manager is always shut down in `finally`.
+- `spawn=True` calls `set_start_method('spawn', force=True)` globally — this is process-global and irreversible within the session.
+- Per-job bars (`show_job_bars=True`) use a background estimation thread (EMA of per-batch time) to animate progress. Bars show at most `min(n_jobs, len(arr))` concurrent entries.
+- `pmap_df` requires `sklearn` (`GroupKFold`) and `numpy` even for non-grouped use — these are not declared as hard dependencies in the package.

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import time
 import warnings
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from .core import run_pmap
 from .progress_bars import (

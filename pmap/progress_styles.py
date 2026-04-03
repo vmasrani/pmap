@@ -11,12 +11,11 @@ from rich.progress import (
 from rich.style import Style
 from rich.text import Text
 
-def make_job_description(job_num: int, total_cpus: int, active_cpus: int, estimating: bool = False) -> Text:
-    """Create a styled job description with minimal, elegant CPU info."""
-    suffix = " (timing...)" if estimating else ""
+def make_job_description(job_num: int) -> Text:
+    """Create a styled job description."""
     return Text.assemble(
-        ("", "dim cyan"),  # Subtle process icon
-        (f" Job {job_num:02d}{suffix}", "bold white" if not estimating else "dim white"),
+        ("", "dim cyan"),
+        (f" Job {job_num:02d}", "bold white"),
     )
 
 def create_progress_columns(disable_tqdm: bool = False) -> tuple[Progress, Progress]:

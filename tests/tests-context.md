@@ -1,19 +1,21 @@
 # tests
-> Test suite for pmap — covers both backends (rich/tqdm), all execution modes, edge cases, and notebook compatibility.
-`2 files | 2026-04-02`
+> Test suite for pmap — pytest correctness tests parametrized across backends, plus a standalone performance benchmark.
+`3 files | 2026-04-03`
 
 | Entry | Purpose |
 |-------|---------|
-| `test_pmap.py` | Executable script (uv shebang) — run directly via `uv run tests/test_pmap.py`; covers rich+tqdm backends, processes+threads, safe_mode, batch_size, warnings |
-| `test_notebook.ipynb` | Jupyter notebook verifying auto-detection of notebook env → tqdm backend; also verifies `show_job_bars` silently degrades to simple bar in notebooks |
+| `test_pmap_comprehensive.py` | Pytest suite covering correctness across `rich` and `tqdm` backends, safe_mode, batch_size, edge cases, and `pmap_df`; run with `uv run pytest tests/test_pmap_comprehensive.py -v` |
+| `benchmark.py` | Standalone CLI script (typer) that times 10 named scenarios with 3 runs each; supports `--output before/after` and `--compare` to diff JSON baselines saved under `screenshots/` |
+| `test_notebook.ipynb` | Interactive notebook-based tests — verifies pmap works correctly inside Jupyter (auto backend detection path) |
 
 <!-- peek -->
 
 ## Conventions
-- `test_pmap.py` is a standalone script with a uv shebang, not a pytest module. Run it directly: `uv run tests/test_pmap.py`. There are no `test_*` functions — all tests live under `if __name__ == "__main__"`.
-- The notebook must be run with `%cd /path/to/pmap` as its first cell (already present) to ensure `from pmap import pmap` resolves correctly from the repo root.
+- All correctness tests are parametrized via `BACKEND_PARAMS = ["rich", "tqdm"]` — every test class runs twice automatically.
+- Worker functions are defined at module level (not inside tests) because joblib spawns subprocesses that must be able to import them; lambdas or nested functions will fail with process-based parallelism.
+- `benchmark.py` uses the uv shebang and is run directly (`uv run tests/benchmark.py`), not via pytest.
 
 ## Gotchas
-- `safe_mode=True` returns a list where failed items are dicts with keys `error`, `error_type`, `args`, `kwargs` — not exceptions. Assertions check `isinstance(result, dict) and result['error_type'] == 'ValueError'`.
-- In notebooks, `show_job_bars=True` is silently ignored and falls back to a simple tqdm bar — no error is raised, so tests pass but per-job bars are not displayed.
-- Auto backend detection uses `is_notebook()` (importable from `pmap`) — `'rich'` in terminal, `'tqdm'` in notebooks.
+- `safe_mode=True` returns a dict with keys `error_type`, `args`, `kwargs` on failure — tests assert this shape explicitly; changing the error dict schema will break assertions at lines 158-162.
+- `test_large_array` uses 500 items with `worker_fast` (no sleep) — if batch_size auto-calculation changes, this test can silently produce wrong ordering.
+- The benchmark saves JSON baselines to `screenshots/before/benchmark.json` and `screenshots/after/benchmark.json` relative to the project root; that directory must exist before using `--output`.
