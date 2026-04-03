@@ -12,6 +12,7 @@ dependencies = [
     "pandas",
     "scikit-learn",
     "ipykernel>=7.1.0",
+    "ipywidgets>=7.5.0",
 ]
 
 [build-system]

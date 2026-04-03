@@ -26,6 +26,39 @@ def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub('', text)
 
 
+class AnsiStrippingStdoutProxy:
+    """Stdout proxy that strips ANSI escape codes before writing.
+
+    Used in notebook thread/sequential modes where print() and rich.print()
+    write directly to stdout with ANSI codes that render as garbage in Jupyter.
+    """
+    def __init__(self, real_stdout):
+        self._real = real_stdout
+
+    def write(self, msg: str) -> int:
+        return self._real.write(strip_ansi(msg))
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@contextlib.contextmanager
+def notebook_stdout_filter():
+    """Strip ANSI from stdout in notebook environments. No-op in terminals."""
+    if not is_notebook():
+        yield
+        return
+    old_stdout = sys.stdout
+    sys.stdout = AnsiStrippingStdoutProxy(old_stdout)
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+
+
 def safe_write(pbar, message: str) -> None:
     """Write message compatible with both terminal and notebook."""
     if is_notebook():
@@ -87,7 +120,7 @@ def sequential_map(f: Callable, arr: list, desc: str, disable: bool) -> list:
         return [f(item) for item in arr]
 
     results = []
-    with redirect_loguru_to_tqdm() as pbar_ref:
+    with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
         pbar = tqdm(arr, desc=desc)
         pbar_ref[0] = pbar
         for item in pbar:
@@ -176,7 +209,7 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
     try:
         with log_consumer_tqdm(mode.log_queue, pbar):
             if mode.using_threads:
-                with redirect_loguru_to_tqdm() as pbar_ref:
+                with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
                     pbar_ref[0] = pbar
                     results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
                         delayed(mode.wrapped_func)(i) for i in arr
@@ -239,7 +272,7 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
     try:
         with log_consumer_tqdm(mode.log_queue, overall):
             if mode.using_threads:
-                with redirect_loguru_to_tqdm() as pbar_ref:
+                with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
                     pbar_ref[0] = overall
                     results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
                         delayed(mode.wrapped_func)(i) for i in arr
