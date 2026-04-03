@@ -272,7 +272,7 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
 
 def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
                       disable_tqdm: bool, desc: str, total_tasks: int,
-                      total_cpus: int, kwargs: dict) -> list:
+                      total_cpus: int, kwargs: dict, job_bar_style: str = 'pulse') -> list:
     """Run with per-job tqdm progress bars."""
     if is_notebook():
         return run_with_simple_bar(mode, arr, n_jobs, batch_size,

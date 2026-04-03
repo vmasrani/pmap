@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import threading
 import time
 from typing import Callable
@@ -106,7 +107,7 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size, 
     return results
 
 
-def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, disable_tqdm: bool, desc: str, total_tasks: int, total_cpus: int, kwargs: dict) -> list:
+def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, disable_tqdm: bool, desc: str, total_tasks: int, total_cpus: int, kwargs: dict, job_bar_style: str = 'pulse') -> list:
     """Run parallel execution with per-job progress bars and CPU info."""
     job_progress = create_progress_columns(disable_tqdm)
 
@@ -124,7 +125,7 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, di
         if mode.log_queue:
             stack.enter_context(log_consumer(mode.log_queue, live))
         stack.enter_context(
-            _job_bars_callback(job_progress, task_id, total_cpus, mode.job_queue)
+            _job_bars_callback(job_progress, task_id, total_cpus, mode.job_queue, job_bar_style=job_bar_style)
         )
         if mode.using_threads:
             stack.enter_context(redirect_loguru_to_live(live))
@@ -142,18 +143,33 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, di
 
 
 class _JobTimeEstimator:
-    """Exponential moving average of per-item job times."""
+    """Track per-item job times with EMA and max for conservative estimation."""
 
     def __init__(self, alpha: float = 0.3):
         self._alpha = alpha
         self.avg: float | None = None
+        self.max_time: float = 0.0
+
+    @property
+    def reference(self) -> float | None:
+        """Conservative reference duration: max of EMA and 80% of longest observed job."""
+        return None if self.avg is None else max(self.avg, self.max_time * 0.8)
 
     def record(self, elapsed: float, batch_size: int):
         batch_avg = elapsed / batch_size
+        self.max_time = max(self.max_time, elapsed)
         if self.avg is None:
             self.avg = batch_avg
         else:
             self.avg = self._alpha * batch_avg + (1 - self._alpha) * self.avg
+
+
+def _dampened_progress(elapsed: float, reference: float) -> int:
+    """Dampened fill curve: linear to 70%, then asymptotic approach to 99%."""
+    ratio = elapsed / reference
+    if ratio < 0.7:
+        return int(ratio * 100)
+    return min(99, int(70 + 29 * (1 - math.exp(-3 * (ratio - 0.7)))))
 
 
 def _start_estimation_thread(
@@ -164,12 +180,13 @@ def _start_estimation_thread(
 
     def run():
         while not stop.is_set():
-            if estimator.avg:
+            ref = estimator.reference
+            if ref:
                 now = time.time()
                 with lock:
                     for job_task_id, start_time in list(active_jobs.values()):
                         elapsed = now - start_time
-                        pct = min(99, int(100 * elapsed / estimator.avg))
+                        pct = _dampened_progress(elapsed, ref)
                         job_progress.update(job_task_id, completed=pct)
             time.sleep(PROGRESS_POLL_INTERVAL)
 
@@ -180,10 +197,13 @@ def _start_estimation_thread(
 
 def _start_signal_monitor(
     job_queue, job_progress, overall_task_id,
-    active_jobs: dict, estimator: _JobTimeEstimator, lock: threading.Lock,
+    active_jobs: dict, lock: threading.Lock,
+    job_bar_style: str = 'pulse',
+    estimator: _JobTimeEstimator | None = None,
 ) -> tuple[threading.Event, threading.Thread]:
     """Monitor thread that reacts to worker start/done signals to manage per-job bars."""
     stop = threading.Event()
+    use_pulse = job_bar_style == 'pulse'
     import queue as queue_module
 
     def run():
@@ -195,10 +215,14 @@ def _start_signal_monitor(
 
             now = time.time()
             if signal == "start":
-                task_id = job_progress.add_task(
-                    make_job_description(item_idx + 1),
-                    total=100, completed=0,
-                )
+                if use_pulse:
+                    task_id = job_progress.add_task(
+                        make_job_description(item_idx + 1), total=None,
+                    )
+                else:
+                    task_id = job_progress.add_task(
+                        make_job_description(item_idx + 1), total=100, completed=0,
+                    )
                 with lock:
                     active_jobs[item_idx] = (task_id, now)
             elif signal == "done":
@@ -207,8 +231,10 @@ def _start_signal_monitor(
                 if entry:
                     task_id, start_time = entry
                     elapsed = now - start_time
-                    estimator.record(elapsed, 1)
-                    job_progress.update(task_id, completed=100)
+                    if estimator:
+                        estimator.record(elapsed, 1)
+                    if not use_pulse:
+                        job_progress.update(task_id, completed=100)
                     job_progress.remove_task(task_id)
                 job_progress.update(overall_task_id, advance=1)
 
@@ -218,19 +244,22 @@ def _start_signal_monitor(
 
 
 @contextlib.contextmanager
-def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None):
+def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None, job_bar_style='pulse'):
     """Manage per-job progress bars via worker signals (or batch callback fallback)."""
-    estimator = _JobTimeEstimator()
     active_jobs: dict[int, tuple] = {}  # item_idx -> (task_id, start_time)
     lock = threading.Lock()
+    use_estimation = job_bar_style == 'estimate'
 
-    stop_est, est_thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
+    estimator = _JobTimeEstimator() if use_estimation else None
+    if use_estimation and estimator is not None:
+        stop_est, est_thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
 
     if job_queue is not None:
         # Signal-driven mode: monitor thread handles per-job bars
         stop_mon, mon_thread = _start_signal_monitor(
             job_queue, job_progress, overall_task_id,
-            active_jobs, estimator, lock,
+            active_jobs, lock,
+            job_bar_style=job_bar_style, estimator=estimator,
         )
 
         # Batch callback only needed as a no-op (joblib requires it)
@@ -244,8 +273,9 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
             finally:
                 stop_mon.set()
                 mon_thread.join(timeout=2.0)
-                stop_est.set()
-                est_thread.join(timeout=1.0)
+                if use_estimation:
+                    stop_est.set()
+                    est_thread.join(timeout=1.0)
                 # Drain any remaining signals
                 import queue as queue_module
                 while True:
@@ -254,13 +284,15 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
                         if signal == "done":
                             entry = active_jobs.pop(item_idx, None)
                             if entry:
-                                job_progress.update(entry[0], completed=100)
+                                if use_estimation:
+                                    job_progress.update(entry[0], completed=100)
                                 job_progress.remove_task(entry[0])
                             job_progress.update(overall_task_id, advance=1)
                     except (queue_module.Empty, OSError):
                         break
                 for task_id, _ in active_jobs.values():
-                    job_progress.update(task_id, completed=100)
+                    if use_estimation:
+                        job_progress.update(task_id, completed=100)
                     job_progress.remove_task(task_id)
                 active_jobs.clear()
                 job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)
@@ -278,6 +310,7 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
             try:
                 yield
             finally:
-                stop_est.set()
-                est_thread.join(timeout=1.0)
+                if use_estimation:
+                    stop_est.set()
+                    est_thread.join(timeout=1.0)
                 job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)

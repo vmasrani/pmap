@@ -4,6 +4,7 @@ from rich.progress import (
     SpinnerColumn,
     BarColumn,
     TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
 )
 from rich.text import Text
@@ -27,7 +28,7 @@ def create_progress_columns(disable_tqdm: bool = False) -> Progress:
             finished_style="bright_cyan",
         ),
         TextColumn("[cyan]{task.percentage:>3.0f}%"),
-        TimeRemainingColumn(),
+        TimeElapsedColumn(),
         disable=disable_tqdm,
         expand=True,
         auto_refresh=False,

@@ -1,4 +1,6 @@
 """Demo: per-job progress bars with realistic variable-duration data processing."""
+import sys
+
 import numpy as np
 import pandas as pd
 from pmap import pmap
@@ -41,11 +43,14 @@ def process_chunk(seed: int) -> dict:
 
 
 if __name__ == "__main__":
+    style = "estimate" if "--estimate" in sys.argv else "pulse"
+    print(f"Using job_bar_style={style!r}  (pass --estimate to compare)\n")
     results = pmap(
         process_chunk,
         range(60),
         n_jobs=8,
         show_job_bars=True,
+        job_bar_style=style,
         desc="Processing",
     )
     print(f"\nDone! Processed {sum(r['n_rows'] for r in results):,} total rows across {len(results)} chunks.")

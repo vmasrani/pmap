@@ -8,11 +8,6 @@ dependencies = [
     "loguru>=0.7.3",
     "rich>=12.0.0",
     "tqdm>=4.66.0",
-    "numpy",
-    "pandas",
-    "scikit-learn",
-    "ipykernel>=7.1.0",
-    "ipywidgets>=7.5.0",
 ]
 
 [build-system]
@@ -23,4 +18,9 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=9.0.2",
     "typer>=0.24.1",
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=7.5.0",
 ]

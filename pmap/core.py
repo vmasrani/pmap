@@ -7,7 +7,7 @@ from __future__ import annotations
 import contextlib
 import multiprocessing
 import queue
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import joblib
@@ -84,6 +84,7 @@ def run_pmap(
     spawn: bool,
     batch_size,
     show_job_bars: bool,
+    job_bar_style: str,
     safe_mode: bool,
     safe_fn: Callable,
     sequential_map_fn: Callable,
@@ -113,7 +114,7 @@ def run_pmap(
         if show_job_bars:
             results = run_job_bars_fn(
                 mode, arr, n_jobs, batch_size, disable_tqdm, desc,
-                total_tasks, total_cpus, kwargs
+                total_tasks, total_cpus, kwargs, job_bar_style=job_bar_style
             )
         else:
             results = run_simple_fn(
