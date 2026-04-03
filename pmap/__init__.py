@@ -66,7 +66,8 @@ def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, ba
         disable_tqdm: Disable progress bar
         safe_mode: Catch exceptions and return error dicts instead of raising
         spawn: Use spawn multiprocessing start method
-        batch_size: Joblib batch size ('auto' or int)
+        batch_size: Joblib batch size ('auto' or int). Forced to 1 when
+            show_job_bars=True to ensure all workers are visible.
         show_job_bars: Show per-job progress bars with CPU info (default: False)
         backend: 'auto' (default), 'rich', or 'tqdm'
                  'auto' uses tqdm in notebooks (Rich doesn't support notebooks)

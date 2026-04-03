@@ -1,3 +1,4 @@
+import shutil
 from typing import Any
 from rich.progress import (
     Progress,
@@ -57,7 +58,7 @@ def create_progress_table(
             title=title,
             border_style="dim cyan",
             padding=(1, 1),
-            height=15,
+            height=min(total_cpus + 5, shutil.get_terminal_size().lines - 3),
             width=100,
             title_align="left",
         )

@@ -100,6 +100,10 @@ def run_pmap(
     if spawn:
         multiprocessing.set_start_method('spawn', force=True)
 
+    # Force batch_size=1 with job bars so every worker is visible
+    if show_job_bars and batch_size == 'auto':
+        batch_size = 1
+
     f = safe_fn(f) if safe_mode else f
 
     if n_jobs == 1:
