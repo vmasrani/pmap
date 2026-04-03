@@ -9,18 +9,12 @@ Usage:
 """
 from __future__ import annotations
 
-import multiprocessing
 import time
 import warnings
 from typing import Callable
 
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import GroupKFold
-
-from .loguru_routing import reinject_loguru
+from .core import run_pmap
 from .progress_bars import (
-    prepare_parallel_mode,
     sequential_map,
     run_with_simple_bar,
     run_with_job_bars,
@@ -85,66 +79,41 @@ def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, ba
           loguru and appears above the progress bar in real-time
         - In thread mode, output goes directly to stdout (shared between threads)
     """
-    # Auto-select backend: tqdm for notebooks (Rich Live doesn't work), rich otherwise
     if backend == 'auto':
         backend = 'tqdm' if is_notebook() else 'rich'
 
-    # Use tqdm backend
     if backend == 'tqdm':
         from .tqdm_backend import pmap as tqdm_pmap
         return tqdm_pmap(f, arr, n_jobs=n_jobs, disable_tqdm=disable_tqdm,
                          safe_mode=safe_mode, spawn=spawn, batch_size=batch_size,
                          show_job_bars=show_job_bars, **kwargs)
 
-    # Rich backend (default for terminal)
-    arr = list(arr)
-    desc = kwargs.pop('desc', 'Processing')
-    total_tasks = len(arr)
-
-    if spawn:
-        multiprocessing.set_start_method('spawn', force=True)
-
-    f = safe(f) if safe_mode else f
-
-    if n_jobs == 1:
-        return sequential_map(f, arr, desc, disable_tqdm)
-
-    mode = prepare_parallel_mode(f, kwargs.get('prefer'))
-
-    actual_n_jobs = n_jobs if n_jobs != -1 else multiprocessing.cpu_count()
-    total_cpus = min(actual_n_jobs, total_tasks)
-
-    try:
-        if show_job_bars:
-            results = run_with_job_bars(
-                mode, arr, n_jobs, batch_size, disable_tqdm, desc, total_tasks, total_cpus, kwargs
-            )
-        else:
-            results = run_with_simple_bar(
-                mode, arr, n_jobs, batch_size, disable_tqdm, desc, kwargs
-            )
-    finally:
-        if mode.stripped_names:
-            reinject_loguru(f, mode.stripped_names)
-        if mode.manager is not None:
-            mode.manager.shutdown()
-
-    return results
+    return run_pmap(
+        f, arr, n_jobs=n_jobs, disable_tqdm=disable_tqdm, spawn=spawn,
+        batch_size=batch_size, show_job_bars=show_job_bars, safe_mode=safe_mode,
+        safe_fn=safe, sequential_map_fn=sequential_map,
+        run_simple_fn=run_with_simple_bar, run_job_bars_fn=run_with_job_bars,
+        **kwargs,
+    )
 
 
 def pmap_df(
     f: Callable,
-    df: pd.DataFrame,
+    df: "pd.DataFrame",
     n_chunks: int = 100,
     groups: str | None = None,
     axis: int = 0,
     safe_mode: bool = False,
-    **kwargs
-) -> pd.DataFrame:
+    **kwargs,
+) -> "pd.DataFrame":
     """Parallel map over DataFrame chunks.
 
     See: https://towardsdatascience.com/make-your-own-super-pandas-using-multiproc-1c04f41944a1
     """
+    import numpy as np
+    import pandas as pd
+    from sklearn.model_selection import GroupKFold
+
     if groups:
         n_chunks = min(n_chunks, df[groups].nunique())
         group_kfold = GroupKFold(n_splits=n_chunks)
@@ -156,19 +125,9 @@ def pmap_df(
 
 
 def run_async(func):
-    """Run function asynchronously and return a queue for retrieving results.
+    """Run function asynchronously and return a queue for retrieving results."""
+    import multiprocessing
 
-    Example:
-        @run_async
-        def long_run(idx, val='cat'):
-            for i in range(idx):
-                print(i)
-                time.sleep(1)
-            return val
-
-        queue = long_run(5, val='dog')
-        result = queue.get()
-    """
     def func_with_queue(queue, *args, **kwargs):
         print(f'Running function {func.__name__}{args} {kwargs} ... ')
         start_time = time.perf_counter()

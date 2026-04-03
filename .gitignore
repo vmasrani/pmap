@@ -39,3 +39,7 @@ htmlcov/
 # uv
 .uv/
 uv.lock
+
+# Demo artifacts
+screenshots/
+demo/before-*.tape
