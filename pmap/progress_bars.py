@@ -33,6 +33,42 @@ REFRESH_RATE = 16
 PROGRESS_POLL_INTERVAL = 0.1
 
 
+class _SlotPool:
+    """Pre-allocated pool of progress bar slots to avoid add/remove flicker."""
+
+    def __init__(self, job_progress, total_cpus: int, use_pulse: bool):
+        self._progress = job_progress
+        self._use_pulse = use_pulse
+        self._lock = threading.Lock()
+        self._free: list = []
+        for _ in range(total_cpus):
+            if use_pulse:
+                tid = job_progress.add_task("", total=None, visible=False)
+            else:
+                tid = job_progress.add_task("", total=100, completed=0, visible=False)
+            self._free.append(tid)
+
+    def acquire(self, description):
+        """Grab a free slot, make it visible with the given description."""
+        with self._lock:
+            if not self._free:
+                return None
+            tid = self._free.pop()
+        if self._use_pulse:
+            self._progress.update(tid, description=description, total=None, visible=True)
+        else:
+            self._progress.update(tid, description=description, total=100, completed=0, visible=True)
+        self._progress.start_task(tid)
+        return tid
+
+    def release(self, tid):
+        """Hide the slot and return it to the free pool."""
+        self._progress.update(tid, visible=False)
+        self._progress.stop_task(tid)
+        with self._lock:
+            self._free.append(tid)
+
+
 @contextlib.contextmanager
 def progress_with_live(desc: str, total: int, disable: bool = False):
     """Progress bar with Live display that allows printing above it."""
@@ -198,12 +234,12 @@ def _start_estimation_thread(
 def _start_signal_monitor(
     job_queue, job_progress, overall_task_id,
     active_jobs: dict, lock: threading.Lock,
+    slot_pool: _SlotPool,
     job_bar_style: str = 'pulse',
     estimator: _JobTimeEstimator | None = None,
 ) -> tuple[threading.Event, threading.Thread]:
     """Monitor thread that reacts to worker start/done signals to manage per-job bars."""
     stop = threading.Event()
-    use_pulse = job_bar_style == 'pulse'
     import queue as queue_module
 
     def run():
@@ -215,16 +251,10 @@ def _start_signal_monitor(
 
             now = time.time()
             if signal == "start":
-                if use_pulse:
-                    task_id = job_progress.add_task(
-                        make_job_description(item_idx + 1), total=None,
-                    )
-                else:
-                    task_id = job_progress.add_task(
-                        make_job_description(item_idx + 1), total=100, completed=0,
-                    )
-                with lock:
-                    active_jobs[item_idx] = (task_id, now)
+                task_id = slot_pool.acquire(make_job_description(item_idx + 1))
+                if task_id is not None:
+                    with lock:
+                        active_jobs[item_idx] = (task_id, now)
             elif signal == "done":
                 with lock:
                     entry = active_jobs.pop(item_idx, None)
@@ -233,9 +263,7 @@ def _start_signal_monitor(
                     elapsed = now - start_time
                     if estimator:
                         estimator.record(elapsed, 1)
-                    if not use_pulse:
-                        job_progress.update(task_id, completed=100)
-                    job_progress.remove_task(task_id)
+                    slot_pool.release(task_id)
                 job_progress.update(overall_task_id, advance=1)
 
     thread = threading.Thread(target=run, daemon=True)
@@ -249,8 +277,11 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
     active_jobs: dict[int, tuple] = {}  # item_idx -> (task_id, start_time)
     lock = threading.Lock()
     use_estimation = job_bar_style == 'estimate'
+    use_pulse = job_bar_style == 'pulse'
 
     estimator = _JobTimeEstimator() if use_estimation else None
+    slot_pool = _SlotPool(job_progress, total_cpus, use_pulse)
+
     if use_estimation and estimator is not None:
         stop_est, est_thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
 
@@ -259,6 +290,7 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
         stop_mon, mon_thread = _start_signal_monitor(
             job_queue, job_progress, overall_task_id,
             active_jobs, lock,
+            slot_pool=slot_pool,
             job_bar_style=job_bar_style, estimator=estimator,
         )
 
@@ -284,16 +316,12 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
                         if signal == "done":
                             entry = active_jobs.pop(item_idx, None)
                             if entry:
-                                if use_estimation:
-                                    job_progress.update(entry[0], completed=100)
-                                job_progress.remove_task(entry[0])
+                                slot_pool.release(entry[0])
                             job_progress.update(overall_task_id, advance=1)
                     except (queue_module.Empty, OSError):
                         break
                 for task_id, _ in active_jobs.values():
-                    if use_estimation:
-                        job_progress.update(task_id, completed=100)
-                    job_progress.remove_task(task_id)
+                    slot_pool.release(task_id)
                 active_jobs.clear()
                 job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)
     else:

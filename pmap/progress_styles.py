@@ -7,8 +7,18 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
+    TaskProgressColumn,
 )
 from rich.text import Text
+
+
+class _ConditionalPercentage(TaskProgressColumn):
+    """Show percentage only for tasks with a known total (hides for pulse bars)."""
+
+    def render(self, task):
+        if task.total is None:
+            return Text("", style="cyan")
+        return Text(f"{task.percentage:>3.0f}%", style="cyan")
 
 def make_job_description(job_num: int) -> Text:
     """Create a styled job description."""
@@ -28,7 +38,7 @@ def create_progress_columns(disable_tqdm: bool = False) -> Progress:
             complete_style="cyan",
             finished_style="bright_cyan",
         ),
-        TextColumn("[cyan]{task.percentage:>3.0f}%"),
+        _ConditionalPercentage(),
         TimeElapsedColumn(),
         disable=disable_tqdm,
         expand=True,
