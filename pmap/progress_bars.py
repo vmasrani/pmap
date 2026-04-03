@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import itertools
 import threading
 import time
 from typing import Callable
@@ -18,8 +17,6 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.text import Text
-
 from .core import ParallelMode, joblib_callback_patch
 from .loguru_routing import redirect_loguru_to_live, log_consumer
 from .progress_styles import (
@@ -111,19 +108,15 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size, 
 
 def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, disable_tqdm: bool, desc: str, total_tasks: int, total_cpus: int, kwargs: dict) -> list:
     """Run parallel execution with per-job progress bars and CPU info."""
-    job_progress, overall_progress = create_progress_columns(disable_tqdm)
+    job_progress = create_progress_columns(disable_tqdm)
 
     task_id = job_progress.add_task(desc, total=total_tasks)
-    overall_task_id = overall_progress.add_task(
-        str(Text.assemble(("", "dim blue"), (" Total", "bold white"))),
-        total=total_tasks
-    )
 
     class DynamicProgressTable:
         def __rich__(self):
             completed = int(job_progress.tasks[task_id].completed)
             return create_progress_table(
-                job_progress, overall_progress, total_cpus, completed, total_tasks
+                job_progress, total_cpus, completed, total_tasks
             )
 
     with contextlib.ExitStack() as stack:
@@ -131,13 +124,19 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, di
         if mode.log_queue:
             stack.enter_context(log_consumer(mode.log_queue, live))
         stack.enter_context(
-            _job_bars_callback(job_progress, overall_progress, task_id, overall_task_id, total_cpus)
+            _job_bars_callback(job_progress, task_id, total_cpus, mode.job_queue)
         )
         if mode.using_threads:
             stack.enter_context(redirect_loguru_to_live(live))
-        results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
-            delayed(mode.wrapped_func)(i) for i in arr
-        )
+
+        if mode.job_queue:
+            results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
+                delayed(mode.wrapped_func)(idx, item) for idx, item in enumerate(arr)
+            )
+        else:
+            results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
+                delayed(mode.wrapped_func)(i) for i in arr
+            )
 
     return results
 
@@ -168,7 +167,7 @@ def _start_estimation_thread(
             if estimator.avg:
                 now = time.time()
                 with lock:
-                    for job_task_id, start_time, _ in list(active_jobs.values()):
+                    for job_task_id, start_time in list(active_jobs.values()):
                         elapsed = now - start_time
                         pct = min(99, int(100 * elapsed / estimator.avg))
                         job_progress.update(job_task_id, completed=pct)
@@ -179,50 +178,106 @@ def _start_estimation_thread(
     return stop, thread
 
 
-@contextlib.contextmanager
-def _job_bars_callback(job_progress, overall_progress, overall_job_task_id, overall_progress_task_id, total_cpus):
-    """Monkeypatch joblib callback for per-job progress bars with time estimation."""
-    estimator = _JobTimeEstimator()
-    active_jobs: dict[int, tuple] = {}  # job_idx -> (task_id, start_time, job_number)
-    lock = threading.Lock()
-    job_counter = itertools.count(1)
-    batch_start_time = [time.time()]
-    completed_jobs = [0]
+def _start_signal_monitor(
+    job_queue, job_progress, overall_task_id,
+    active_jobs: dict, estimator: _JobTimeEstimator, lock: threading.Lock,
+) -> tuple[threading.Event, threading.Thread]:
+    """Monitor thread that reacts to worker start/done signals to manage per-job bars."""
+    stop = threading.Event()
+    import queue as queue_module
 
-    stop, thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
+    def run():
+        while not stop.is_set():
+            try:
+                signal, item_idx = job_queue.get(timeout=0.05)
+            except (queue_module.Empty, OSError):
+                continue
 
-    class Callback(joblib.parallel.BatchCompletionCallBack):
-        def __call__(self, *args, **kwargs):
             now = time.time()
-
-            if self.batch_size > 0:
-                estimator.record(now - batch_start_time[0], self.batch_size)
-                batch_start_time[0] = now
-
-            with lock:
-                # Keep at most total_cpus bars visible
-                while len(active_jobs) >= total_cpus:
-                    oldest = min(active_jobs)
-                    job_progress.remove_task(active_jobs.pop(oldest)[0])
-
-                job_number = next(job_counter)
-                new_task_id = job_progress.add_task(
-                    make_job_description(job_number),
+            if signal == "start":
+                task_id = job_progress.add_task(
+                    make_job_description(item_idx + 1),
                     total=100, completed=0,
                 )
-                active_jobs[completed_jobs[0]] = (new_task_id, now, job_number)
+                with lock:
+                    active_jobs[item_idx] = (task_id, now)
+            elif signal == "done":
+                with lock:
+                    entry = active_jobs.pop(item_idx, None)
+                if entry:
+                    task_id, start_time = entry
+                    elapsed = now - start_time
+                    estimator.record(elapsed, 1)
+                    job_progress.update(task_id, completed=100)
+                    job_progress.remove_task(task_id)
+                job_progress.update(overall_task_id, advance=1)
 
-            job_progress.update(overall_job_task_id, advance=self.batch_size)
-            overall_progress.update(overall_progress_task_id, advance=self.batch_size)
-            completed_jobs[0] += self.batch_size
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return stop, thread
 
-            return super().__call__(*args, **kwargs)
 
-    with joblib_callback_patch(Callback):
-        try:
-            yield
-        finally:
-            stop.set()
-            thread.join(timeout=1.0)
-            job_progress.update(overall_job_task_id, completed=job_progress.tasks[overall_job_task_id].total)
-            overall_progress.update(overall_progress_task_id, completed=overall_progress.tasks[overall_progress_task_id].total)
+@contextlib.contextmanager
+def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None):
+    """Manage per-job progress bars via worker signals (or batch callback fallback)."""
+    estimator = _JobTimeEstimator()
+    active_jobs: dict[int, tuple] = {}  # item_idx -> (task_id, start_time)
+    lock = threading.Lock()
+
+    stop_est, est_thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
+
+    if job_queue is not None:
+        # Signal-driven mode: monitor thread handles per-job bars
+        stop_mon, mon_thread = _start_signal_monitor(
+            job_queue, job_progress, overall_task_id,
+            active_jobs, estimator, lock,
+        )
+
+        # Batch callback only needed as a no-op (joblib requires it)
+        class Callback(joblib.parallel.BatchCompletionCallBack):
+            def __call__(self, *args, **kwargs):
+                return super().__call__(*args, **kwargs)
+
+        with joblib_callback_patch(Callback):
+            try:
+                yield
+            finally:
+                stop_mon.set()
+                mon_thread.join(timeout=2.0)
+                stop_est.set()
+                est_thread.join(timeout=1.0)
+                # Drain any remaining signals
+                import queue as queue_module
+                while True:
+                    try:
+                        signal, item_idx = job_queue.get_nowait()
+                        if signal == "done":
+                            entry = active_jobs.pop(item_idx, None)
+                            if entry:
+                                job_progress.update(entry[0], completed=100)
+                                job_progress.remove_task(entry[0])
+                            job_progress.update(overall_task_id, advance=1)
+                    except (queue_module.Empty, OSError):
+                        break
+                for task_id, _ in active_jobs.values():
+                    job_progress.update(task_id, completed=100)
+                    job_progress.remove_task(task_id)
+                active_jobs.clear()
+                job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)
+    else:
+        # Fallback: batch callback mode (no job_queue available)
+        completed_jobs = [0]
+
+        class Callback(joblib.parallel.BatchCompletionCallBack):
+            def __call__(self, *args, **kwargs):
+                job_progress.update(overall_task_id, advance=self.batch_size)
+                completed_jobs[0] += self.batch_size
+                return super().__call__(*args, **kwargs)
+
+        with joblib_callback_patch(Callback):
+            try:
+                yield
+            finally:
+                stop_est.set()
+                est_thread.join(timeout=1.0)
+                job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)

@@ -247,17 +247,22 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
             pbar.update(n=self.batch_size)
             return super().__call__(out)
 
+    def _make_calls():
+        if mode.job_queue:
+            return (delayed(mode.wrapped_func)(idx, item) for idx, item in enumerate(arr))
+        return (delayed(mode.wrapped_func)(i) for i in arr)
+
     try:
         with joblib_callback_patch(TqdmCallback), log_consumer_tqdm(mode.log_queue, pbar):
             if mode.using_threads:
                 with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
                     pbar_ref[0] = pbar
                     results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
-                        delayed(mode.wrapped_func)(i) for i in arr
+                        _make_calls()
                     )
             else:
                 results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
-                    delayed(mode.wrapped_func)(i) for i in arr
+                    _make_calls()
                 )
     finally:
         pbar.close()
@@ -277,46 +282,121 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size,
                    disable=disable_tqdm, leave=True)
     active_bars = {}
     bar_lock = threading.Lock()
-    job_counter = [0]
 
-    class TqdmJobCallback(joblib.parallel.BatchCompletionCallBack):
-        def __call__(self, out):
-            with bar_lock:
-                overall.update(n=self.batch_size)
-                job_counter[0] += 1
-                job_num = job_counter[0]
+    def _make_delayed_calls():
+        if mode.job_queue:
+            return (delayed(mode.wrapped_func)(idx, item) for idx, item in enumerate(arr))
+        return (delayed(mode.wrapped_func)(i) for i in arr)
 
-                while len(active_bars) >= total_cpus:
-                    oldest = min(active_bars.keys())
-                    active_bars[oldest].close()
-                    del active_bars[oldest]
+    if mode.job_queue:
+        # Signal-driven mode: monitor thread manages per-job bars
+        stop_event = threading.Event()
 
-                pos = (len(active_bars) % total_cpus) + 1
-                bar = tqdm(total=1, desc=f"  Job {job_num:>4}", position=pos,
-                          leave=False, disable=disable_tqdm,
-                          bar_format='{desc}: {bar} | {elapsed}')
-                bar.update(1)
-                active_bars[job_num] = bar
+        def _monitor():
+            bar_position = [1]
+            while not stop_event.is_set():
+                try:
+                    signal, item_idx = mode.job_queue.get(timeout=0.05)
+                except (queue_module.Empty, OSError):
+                    continue
 
-            return super().__call__(out)
+                with bar_lock:
+                    if signal == "start":
+                        pos = bar_position[0]
+                        bar_position[0] = (bar_position[0] % total_cpus) + 1
+                        bar = tqdm(total=1, desc=f"  Job {item_idx + 1:>4}", position=pos,
+                                  leave=False, disable=disable_tqdm,
+                                  bar_format='{desc}: {bar} | {elapsed}')
+                        active_bars[item_idx] = bar
+                    elif signal == "done":
+                        bar = active_bars.pop(item_idx, None)
+                        if bar:
+                            bar.update(1)
+                            bar.close()
+                        overall.update(n=1)
 
-    try:
-        with joblib_callback_patch(TqdmJobCallback), log_consumer_tqdm(mode.log_queue, overall):
-            if mode.using_threads:
-                with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
-                    pbar_ref[0] = overall
+        monitor = threading.Thread(target=_monitor, daemon=True)
+        monitor.start()
+
+        # No-op batch callback (overall is updated by monitor)
+        class TqdmJobCallback(joblib.parallel.BatchCompletionCallBack):
+            def __call__(self, out):
+                return super().__call__(out)
+
+        try:
+            with joblib_callback_patch(TqdmJobCallback), log_consumer_tqdm(mode.log_queue, overall):
+                if mode.using_threads:
+                    with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
+                        pbar_ref[0] = overall
+                        results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
+                            _make_delayed_calls()
+                        )
+                else:
                     results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
-                        delayed(mode.wrapped_func)(i) for i in arr
+                        _make_delayed_calls()
                     )
-            else:
-                results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
-                    delayed(mode.wrapped_func)(i) for i in arr
-                )
-    finally:
-        with bar_lock:
-            for bar in active_bars.values():
-                bar.close()
-        overall.close()
-        print('\n' * total_cpus, end='')
+        finally:
+            stop_event.set()
+            monitor.join(timeout=2.0)
+            # Drain remaining signals
+            while True:
+                try:
+                    signal, item_idx = mode.job_queue.get_nowait()
+                    if signal == "done":
+                        bar = active_bars.pop(item_idx, None)
+                        if bar:
+                            bar.update(1)
+                            bar.close()
+                        overall.update(n=1)
+                except (queue_module.Empty, OSError):
+                    break
+            with bar_lock:
+                for bar in active_bars.values():
+                    bar.close()
+            overall.close()
+            print('\n' * total_cpus, end='')
+    else:
+        # Fallback: batch callback mode
+        job_counter = [0]
+
+        class TqdmJobCallback(joblib.parallel.BatchCompletionCallBack):
+            def __call__(self, out):
+                with bar_lock:
+                    overall.update(n=self.batch_size)
+                    job_counter[0] += 1
+                    job_num = job_counter[0]
+
+                    while len(active_bars) >= total_cpus:
+                        oldest = min(active_bars.keys())
+                        active_bars[oldest].close()
+                        del active_bars[oldest]
+
+                    pos = (len(active_bars) % total_cpus) + 1
+                    bar = tqdm(total=1, desc=f"  Job {job_num:>4}", position=pos,
+                              leave=False, disable=disable_tqdm,
+                              bar_format='{desc}: {bar} | {elapsed}')
+                    bar.update(1)
+                    active_bars[job_num] = bar
+
+                return super().__call__(out)
+
+        try:
+            with joblib_callback_patch(TqdmJobCallback), log_consumer_tqdm(mode.log_queue, overall):
+                if mode.using_threads:
+                    with notebook_stdout_filter(), redirect_loguru_to_tqdm() as pbar_ref:
+                        pbar_ref[0] = overall
+                        results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
+                            _make_delayed_calls()
+                        )
+                else:
+                    results = Parallel(n_jobs=n_jobs, batch_size=batch_size, **kwargs)(
+                        _make_delayed_calls()
+                    )
+        finally:
+            with bar_lock:
+                for bar in active_bars.values():
+                    bar.close()
+            overall.close()
+            print('\n' * total_cpus, end='')
 
     return results

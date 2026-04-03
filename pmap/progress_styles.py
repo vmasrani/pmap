@@ -4,11 +4,8 @@ from rich.progress import (
     SpinnerColumn,
     BarColumn,
     TextColumn,
-    TimeElapsedColumn,
     TimeRemainingColumn,
-    MofNCompleteColumn,
 )
-from rich.style import Style
 from rich.text import Text
 
 def make_job_description(job_num: int) -> Text:
@@ -18,10 +15,9 @@ def make_job_description(job_num: int) -> Text:
         (f" Job {job_num:02d}", "bold white"),
     )
 
-def create_progress_columns(disable_tqdm: bool = False) -> tuple[Progress, Progress]:
-    """Create styled progress bars for overall and job-specific progress."""
-    # Job-specific progress with minimal styling
-    job_progress = Progress(
+def create_progress_columns(disable_tqdm: bool = False) -> Progress:
+    """Create styled progress bar for job-specific progress."""
+    return Progress(
         TextColumn("[progress.description]{task.description}"),
         SpinnerColumn("dots", style="cyan", speed=1.0),
         BarColumn(
@@ -37,26 +33,8 @@ def create_progress_columns(disable_tqdm: bool = False) -> tuple[Progress, Progr
         auto_refresh=False,
     )
 
-    # Overall progress with subtle styling
-    overall_progress = Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(
-            bar_width=50,
-            style="dim blue",
-            complete_style="blue",
-            finished_style="bright_blue",
-        ),
-        TextColumn("[blue]{task.percentage:>3.0f}%"),
-        TimeRemainingColumn(),
-        disable=disable_tqdm,
-        expand=True,
-    )
-
-    return job_progress, overall_progress
-
 def create_progress_table(
     job_progress: Progress,
-    overall_progress: Progress,
     total_cpus: int,
     completed_tasks: int,
     total_tasks: int,
@@ -66,17 +44,6 @@ def create_progress_table(
     from rich.table import Table
 
     progress_table = Table.grid(expand=False)
-
-    progress_table.add_row(
-        Panel(
-            overall_progress,
-            title="[bold blue]Progress",
-            border_style="dim blue",
-            padding=(1, 1),  # Increased vertical padding
-            title_align="left",
-            width=100,
-        )
-    )
 
     if completed_tasks == 0:
         title = f"[cyan bold]Tasks (estimating timing...) • {total_cpus} CPUs"
@@ -88,8 +55,8 @@ def create_progress_table(
             job_progress,
             title=title,
             border_style="dim cyan",
-            padding=(1, 1),  # Increased vertical padding
-            height=15,       # Increased height
+            padding=(1, 1),
+            height=15,
             width=100,
             title_align="left",
         )

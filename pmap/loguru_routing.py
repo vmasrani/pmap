@@ -130,8 +130,8 @@ def reinject_loguru(f: Callable, stripped_names: set[str]) -> None:
                 globs[name] = logger
 
 
-def make_worker_wrapper(f: Callable, config: LoguruConfig) -> Callable:
-    """Create wrapper that routes all output through loguru."""
+def make_worker_wrapper(f: Callable, config: LoguruConfig, job_queue=None) -> Callable:
+    """Create wrapper that routes all output through loguru and optionally signals job lifecycle."""
     def wrapper(*args, **kwargs):
         setup_worker_loguru(config)
         reinject_loguru(f, config.stripped_names)
@@ -143,6 +143,23 @@ def make_worker_wrapper(f: Callable, config: LoguruConfig) -> Callable:
         finally:
             sys.stdout.flush()
             sys.stdout = old_stdout
+
+    return wrapper if job_queue is None else _wrap_with_signals(wrapper, job_queue)
+
+
+def make_signaling_wrapper(f: Callable, job_queue) -> Callable:
+    """Lightweight wrapper for thread mode that signals job start/done."""
+    return _wrap_with_signals(f, job_queue)
+
+
+def _wrap_with_signals(f: Callable, job_queue) -> Callable:
+    """Wrap a function to emit (start, idx) and (done, idx) signals on a queue."""
+    def wrapper(item_index, item):
+        job_queue.put(("start", item_index))
+        try:
+            return f(item)
+        finally:
+            job_queue.put(("done", item_index))
     return wrapper
 
 
