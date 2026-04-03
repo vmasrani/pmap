@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import queue as queue_module
 import threading
 import time
 from typing import Callable
@@ -240,7 +241,6 @@ def _start_signal_monitor(
 ) -> tuple[threading.Event, threading.Thread]:
     """Monitor thread that reacts to worker start/done signals to manage per-job bars."""
     stop = threading.Event()
-    import queue as queue_module
 
     def run():
         while not stop.is_set():
@@ -280,13 +280,13 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
     use_pulse = job_bar_style == 'pulse'
 
     estimator = _JobTimeEstimator() if use_estimation else None
-    slot_pool = _SlotPool(job_progress, total_cpus, use_pulse)
 
     if use_estimation and estimator is not None:
         stop_est, est_thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
 
     if job_queue is not None:
         # Signal-driven mode: monitor thread handles per-job bars
+        slot_pool = _SlotPool(job_progress, total_cpus, use_pulse)
         stop_mon, mon_thread = _start_signal_monitor(
             job_queue, job_progress, overall_task_id,
             active_jobs, lock,
@@ -309,7 +309,6 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
                     stop_est.set()
                     est_thread.join(timeout=1.0)
                 # Drain any remaining signals
-                import queue as queue_module
                 while True:
                     try:
                         signal, item_idx = job_queue.get_nowait()
