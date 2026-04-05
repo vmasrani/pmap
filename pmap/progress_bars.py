@@ -31,13 +31,15 @@ from .progress_styles import (
 )
 
 # Progress bar refresh rate (Hz) — used for simple bar; job bars use dynamic rate
-REFRESH_RATE = 10
+REFRESH_RATE = 8
 MAX_VISIBLE_BARS = 20
 
 
 def _compute_refresh_rate(total_cpus: int) -> float:
     """Lower refresh rate for many bars to reduce terminal I/O."""
-    return max(4, min(10, 200 // max(total_cpus, 1)))
+    if total_cpus <= 8:
+        return 8
+    return 6 if total_cpus <= 16 else 4
 
 
 class _SlotPool:
@@ -333,7 +335,8 @@ def _job_bars_callback(live, job_progress, overall_progress, overall_task_id, to
                     slot_pool.release(task_id)
                 active_jobs.clear()
                 overall_progress.update(overall_task_id, completed=overall_progress.tasks[overall_task_id].total)
-                panel.title = f"[cyan bold]Tasks ({total_tasks}/{total_tasks}) • {total_cpus} CPUs"
+                # Hide the job panel, show only the final overall bar
+                live.update(overall_progress)
                 live.refresh()
     else:
         # Fallback: batch callback mode (no job_queue available)
@@ -347,3 +350,5 @@ def _job_bars_callback(live, job_progress, overall_progress, overall_task_id, to
                 yield
             finally:
                 overall_progress.update(overall_task_id, completed=overall_progress.tasks[overall_task_id].total)
+                live.update(overall_progress)
+                live.refresh()

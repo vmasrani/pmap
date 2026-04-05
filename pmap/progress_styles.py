@@ -53,9 +53,9 @@ def create_job_progress(disable: bool = False) -> Progress:
     """Create per-job progress bar columns (spinner, bar, elapsed)."""
     return Progress(
         TextColumn("[progress.description]{task.description}"),
-        SpinnerColumn("dots", style="cyan", speed=1.0),
+        SpinnerColumn("dots", style="cyan", speed=1.5),
         BarColumn(
-            bar_width=50,
+            bar_width=40,
             style="dim cyan",
             complete_style="cyan",
             finished_style="bright_cyan",
