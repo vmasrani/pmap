@@ -1,9 +1,9 @@
 import shutil
-from typing import Any
 from rich.progress import (
     Progress,
     SpinnerColumn,
     BarColumn,
+    MofNCompleteColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -13,12 +13,13 @@ from rich.text import Text
 
 
 class _ConditionalPercentage(TaskProgressColumn):
-    """Show percentage only for tasks with a known total (hides for pulse bars)."""
+    """Show percentage only for active tasks (hides for inactive/empty slots)."""
 
     def render(self, task):
-        if task.total is None:
+        if task.total is None or task.total == 0:
             return Text("", style="cyan")
         return Text(f"{task.percentage:>3.0f}%", style="cyan")
+
 
 def make_job_description(job_num: int) -> Text:
     """Create a styled job description."""
@@ -27,8 +28,29 @@ def make_job_description(job_num: int) -> Text:
         (f" Job {job_num:02d}", "bold white"),
     )
 
-def create_progress_columns(disable_tqdm: bool = False) -> Progress:
-    """Create styled progress bar for job-specific progress."""
+
+def create_overall_progress(disable: bool = False) -> Progress:
+    """Create the aggregate progress bar (M/N, percentage, time remaining)."""
+    return Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(
+            bar_width=50,
+            style="dim cyan",
+            complete_style="cyan",
+            finished_style="bright_cyan",
+        ),
+        TextColumn("{task.percentage:>3.0f}%", style="cyan"),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        disable=disable,
+    )
+
+
+def create_job_progress(disable: bool = False) -> Progress:
+    """Create per-job progress bar columns (spinner, bar, elapsed)."""
     return Progress(
         TextColumn("[progress.description]{task.description}"),
         SpinnerColumn("dots", style="cyan", speed=1.0),
@@ -40,38 +62,10 @@ def create_progress_columns(disable_tqdm: bool = False) -> Progress:
         ),
         _ConditionalPercentage(),
         TimeElapsedColumn(),
-        disable=disable_tqdm,
-        expand=True,
-        auto_refresh=False,
+        disable=disable,
     )
 
-def create_progress_table(
-    job_progress: Progress,
-    total_cpus: int,
-    completed_tasks: int,
-    total_tasks: int,
-) -> Any:
-    """Create a styled table with progress information."""
-    from rich.panel import Panel
-    from rich.table import Table
 
-    progress_table = Table.grid(expand=False)
-
-    if completed_tasks == 0:
-        title = f"[cyan bold]Tasks (estimating timing...) • {total_cpus} CPUs"
-    else:
-        title = f"[cyan bold]Tasks ({completed_tasks}/{total_tasks}) • {total_cpus} CPUs"
-
-    progress_table.add_row(
-        Panel(
-            job_progress,
-            title=title,
-            border_style="dim cyan",
-            padding=(1, 1),
-            height=min(total_cpus + 5, shutil.get_terminal_size().lines - 3),
-            width=100,
-            title_align="left",
-        )
-    )
-
-    return progress_table
+def compute_panel_height(total_cpus: int) -> int:
+    """Compute fixed panel height based on CPU count and terminal size."""
+    return min(total_cpus + 5, shutil.get_terminal_size().lines - 3)

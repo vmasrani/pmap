@@ -56,7 +56,7 @@ def safe(f: Callable) -> Callable:
     return wrapper
 
 
-def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, batch_size='auto', show_job_bars=False, job_bar_style='pulse', backend='auto', **kwargs):
+def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, batch_size='auto', show_job_bars=False, backend='auto', **kwargs):
     """Parallel map with progress bar.
 
     Args:
@@ -90,11 +90,11 @@ def pmap(f, arr, n_jobs=-1, disable_tqdm=False, safe_mode=False, spawn=False, ba
         from .tqdm_backend import pmap as tqdm_pmap
         return tqdm_pmap(f, arr, n_jobs=n_jobs, disable_tqdm=disable_tqdm,
                          safe_mode=safe_mode, spawn=spawn, batch_size=batch_size,
-                         show_job_bars=show_job_bars, job_bar_style=job_bar_style, **kwargs)
+                         show_job_bars=show_job_bars, **kwargs)
 
     return run_pmap(
         f, arr, n_jobs=n_jobs, disable_tqdm=disable_tqdm, spawn=spawn,
-        batch_size=batch_size, show_job_bars=show_job_bars, job_bar_style=job_bar_style,
+        batch_size=batch_size, show_job_bars=show_job_bars,
         safe_mode=safe_mode,
         safe_fn=safe, sequential_map_fn=sequential_map,
         run_simple_fn=run_with_simple_bar, run_job_bars_fn=run_with_job_bars,

@@ -10,7 +10,9 @@ from typing import Callable
 
 import joblib
 from joblib import Parallel, delayed
+from rich.console import Group
 from rich.live import Live
+from rich.panel import Panel
 from rich.progress import (
     Progress,
     BarColumn,
@@ -22,50 +24,55 @@ from rich.progress import (
 from .core import ParallelMode, joblib_callback_patch
 from .loguru_routing import redirect_loguru_to_live, log_consumer
 from .progress_styles import (
-    create_progress_columns,
-    create_progress_table,
+    create_job_progress,
+    create_overall_progress,
+    compute_panel_height,
     make_job_description,
 )
 
-# Progress bar refresh rate (Hz)
-REFRESH_RATE = 16
+# Progress bar refresh rate (Hz) — used for simple bar; job bars use dynamic rate
+REFRESH_RATE = 10
 
-# Thread polling interval for progress updates (seconds)
-PROGRESS_POLL_INTERVAL = 0.1
+
+def _compute_refresh_rate(total_cpus: int) -> float:
+    """Lower refresh rate for many bars to reduce terminal I/O."""
+    return max(4, min(10, 200 // max(total_cpus, 1)))
 
 
 class _SlotPool:
-    """Pre-allocated pool of progress bar slots to avoid add/remove flicker."""
+    """Pre-allocated pool of progress bar slots to avoid add/remove flicker.
 
-    def __init__(self, job_progress, total_cpus: int, use_pulse: bool):
+    All slots stay visible=True at all times so the rendered line count never
+    changes — inactive slots simply show an empty description with no bar
+    animation, preventing Rich from reflowing content inside the panel.
+    """
+
+    def __init__(self, job_progress, total_cpus: int):
         self._progress = job_progress
-        self._use_pulse = use_pulse
         self._lock = threading.Lock()
         self._free: list = []
         for _ in range(total_cpus):
-            if use_pulse:
-                tid = job_progress.add_task("", total=None, visible=False)
-            else:
-                tid = job_progress.add_task("", total=100, completed=0, visible=False)
+            tid = job_progress.add_task("", total=0, visible=True)
+            job_progress.stop_task(tid)
             self._free.append(tid)
 
     def acquire(self, description):
-        """Grab a free slot, make it visible with the given description."""
+        """Activate a free slot with the given description."""
         with self._lock:
             if not self._free:
                 return None
             tid = self._free.pop()
-        if self._use_pulse:
-            self._progress.update(tid, description=description, total=None, visible=True)
-        else:
-            self._progress.update(tid, description=description, total=100, completed=0, visible=True)
+        # Always use a static empty bar (total=100, completed=0). The spinner
+        # column provides the activity indicator. Pulse bars (total=None)
+        # animate the entire bar width every frame, causing terminal flicker.
+        self._progress.update(tid, description=description, total=100, completed=0, visible=True)
         self._progress.start_task(tid)
         return tid
 
     def release(self, tid):
-        """Hide the slot and return it to the free pool."""
-        self._progress.update(tid, visible=False)
+        """Deactivate the slot back to an empty placeholder."""
         self._progress.stop_task(tid)
+        self._progress.update(tid, description="", total=0, completed=0, visible=True)
         with self._lock:
             self._free.append(tid)
 
@@ -120,7 +127,7 @@ def sequential_map(f: Callable, arr: list, desc: str, disable: bool) -> list:
     )
     task_id = progress.add_task(desc, total=len(arr))
 
-    with Live(progress, refresh_per_second=16, transient=False) as live:
+    with Live(progress, refresh_per_second=REFRESH_RATE, transient=False) as live:
         with redirect_loguru_to_live(live):
             for item in arr:
                 results.append(f(item))
@@ -144,25 +151,31 @@ def run_with_simple_bar(mode: ParallelMode, arr: list, n_jobs: int, batch_size, 
     return results
 
 
-def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, disable_tqdm: bool, desc: str, total_tasks: int, total_cpus: int, kwargs: dict, job_bar_style: str = 'pulse') -> list:
+def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, disable_tqdm: bool, desc: str, total_tasks: int, total_cpus: int, kwargs: dict, **_ignored) -> list:
     """Run parallel execution with per-job progress bars and CPU info."""
-    job_progress = create_progress_columns(disable_tqdm)
+    overall_progress = create_overall_progress(disable_tqdm)
+    overall_task_id = overall_progress.add_task(desc, total=total_tasks)
 
-    task_id = job_progress.add_task(desc, total=total_tasks)
+    job_progress = create_job_progress(disable_tqdm)
 
-    class DynamicProgressTable:
-        def __rich__(self):
-            completed = int(job_progress.tasks[task_id].completed)
-            return create_progress_table(
-                job_progress, total_cpus, completed, total_tasks
-            )
+    panel = Panel(
+        job_progress,
+        title=f"[cyan bold]Tasks (estimating timing...) • {total_cpus} CPUs",
+        border_style="dim cyan",
+        padding=(1, 1),
+        height=compute_panel_height(total_cpus),
+        title_align="left",
+    )
+
+    display = Group(overall_progress, panel)
+    refresh_rate = _compute_refresh_rate(total_cpus)
 
     with contextlib.ExitStack() as stack:
-        live = stack.enter_context(Live(DynamicProgressTable(), refresh_per_second=REFRESH_RATE, transient=False))
+        live = stack.enter_context(Live(display, auto_refresh=False, transient=False))
         if mode.log_queue:
             stack.enter_context(log_consumer(mode.log_queue, live))
         stack.enter_context(
-            _job_bars_callback(job_progress, task_id, total_cpus, mode.job_queue, job_bar_style=job_bar_style)
+            _job_bars_callback(live, job_progress, overall_progress, overall_task_id, total_cpus, panel, total_tasks, mode.job_queue, refresh_rate=refresh_rate)
         )
         if mode.using_threads:
             stack.enter_context(redirect_loguru_to_live(live))
@@ -209,62 +222,66 @@ def _dampened_progress(elapsed: float, reference: float) -> int:
     return min(99, int(70 + 29 * (1 - math.exp(-3 * (ratio - 0.7)))))
 
 
-def _start_estimation_thread(
-    job_progress, active_jobs: dict, estimator: _JobTimeEstimator, lock: threading.Lock
-) -> tuple[threading.Event, threading.Thread]:
-    """Single daemon thread that updates per-job progress bars based on estimated time."""
-    stop = threading.Event()
-
-    def run():
-        while not stop.is_set():
-            ref = estimator.reference
-            if ref:
-                now = time.time()
-                with lock:
-                    for job_task_id, start_time in list(active_jobs.values()):
-                        elapsed = now - start_time
-                        pct = _dampened_progress(elapsed, ref)
-                        job_progress.update(job_task_id, completed=pct)
-            time.sleep(PROGRESS_POLL_INTERVAL)
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    return stop, thread
-
-
-def _start_signal_monitor(
-    job_queue, job_progress, overall_task_id,
+def _start_render_loop(
+    live: Live,
+    job_queue,
+    job_progress,
+    overall_progress, overall_task_id,
     active_jobs: dict, lock: threading.Lock,
     slot_pool: _SlotPool,
-    job_bar_style: str = 'pulse',
-    estimator: _JobTimeEstimator | None = None,
+    panel: Panel, total_tasks: int, total_cpus: int,
+    estimator: _JobTimeEstimator | None,
+    refresh_rate: float,
 ) -> tuple[threading.Event, threading.Thread]:
-    """Monitor thread that reacts to worker start/done signals to manage per-job bars."""
+    """Unified render loop: drain signals, update estimations, render once per cycle."""
     stop = threading.Event()
+    max_signals = total_cpus * 2
 
     def run():
         while not stop.is_set():
-            try:
-                signal, item_idx = job_queue.get(timeout=0.05)
-            except (queue_module.Empty, OSError):
-                continue
-
-            now = time.time()
-            if signal == "start":
-                task_id = slot_pool.acquire(make_job_description(item_idx + 1))
-                if task_id is not None:
+            # 1. Drain all pending signals in one batch
+            drained = 0
+            while drained < max_signals:
+                try:
+                    signal, item_idx = job_queue.get_nowait()
+                except (queue_module.Empty, OSError):
+                    break
+                drained += 1
+                now = time.time()
+                if signal == "start":
+                    task_id = slot_pool.acquire(make_job_description(item_idx + 1))
+                    if task_id is not None:
+                        with lock:
+                            active_jobs[item_idx] = (task_id, now)
+                elif signal == "done":
                     with lock:
-                        active_jobs[item_idx] = (task_id, now)
-            elif signal == "done":
-                with lock:
-                    entry = active_jobs.pop(item_idx, None)
-                if entry:
-                    task_id, start_time = entry
-                    elapsed = now - start_time
-                    if estimator:
-                        estimator.record(elapsed, 1)
-                    slot_pool.release(task_id)
-                job_progress.update(overall_task_id, advance=1)
+                        entry = active_jobs.pop(item_idx, None)
+                    if entry:
+                        task_id, start_time = entry
+                        elapsed = now - start_time
+                        if estimator:
+                            estimator.record(elapsed, 1)
+                        slot_pool.release(task_id)
+                    overall_progress.update(overall_task_id, advance=1)
+                    completed = int(overall_progress.tasks[overall_task_id].completed)
+                    panel.title = f"[cyan bold]Tasks ({completed}/{total_tasks}) • {total_cpus} CPUs"
+
+            # 2. Update estimation bars in one pass
+            if estimator:
+                ref = estimator.reference
+                if ref:
+                    now = time.time()
+                    with lock:
+                        for job_task_id, start_time in list(active_jobs.values()):
+                            elapsed = now - start_time
+                            pct = _dampened_progress(elapsed, ref)
+                            job_progress.update(job_task_id, completed=pct)
+
+            # 3. Single render
+            live.refresh()
+
+            # 4. Sleep until next cycle
+            time.sleep(1.0 / refresh_rate)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -272,26 +289,22 @@ def _start_signal_monitor(
 
 
 @contextlib.contextmanager
-def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None, job_bar_style='pulse'):
+def _job_bars_callback(live, job_progress, overall_progress, overall_task_id, total_cpus, panel, total_tasks, job_queue=None, refresh_rate=4):
     """Manage per-job progress bars via worker signals (or batch callback fallback)."""
     active_jobs: dict[int, tuple] = {}  # item_idx -> (task_id, start_time)
     lock = threading.Lock()
-    use_estimation = job_bar_style == 'estimate'
-    use_pulse = job_bar_style == 'pulse'
-
-    estimator = _JobTimeEstimator() if use_estimation else None
-
-    if use_estimation and estimator is not None:
-        stop_est, est_thread = _start_estimation_thread(job_progress, active_jobs, estimator, lock)
+    estimator = _JobTimeEstimator()
 
     if job_queue is not None:
-        # Signal-driven mode: monitor thread handles per-job bars
-        slot_pool = _SlotPool(job_progress, total_cpus, use_pulse)
-        stop_mon, mon_thread = _start_signal_monitor(
-            job_queue, job_progress, overall_task_id,
+        # Signal-driven mode: unified render loop handles signals + estimation + refresh
+        slot_pool = _SlotPool(job_progress, total_cpus)
+        stop_loop, loop_thread = _start_render_loop(
+            live, job_queue, job_progress,
+            overall_progress, overall_task_id,
             active_jobs, lock,
             slot_pool=slot_pool,
-            job_bar_style=job_bar_style, estimator=estimator,
+            panel=panel, total_tasks=total_tasks, total_cpus=total_cpus,
+            estimator=estimator, refresh_rate=refresh_rate,
         )
 
         # Batch callback only needed as a no-op (joblib requires it)
@@ -303,11 +316,8 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
             try:
                 yield
             finally:
-                stop_mon.set()
-                mon_thread.join(timeout=2.0)
-                if use_estimation:
-                    stop_est.set()
-                    est_thread.join(timeout=1.0)
+                stop_loop.set()
+                loop_thread.join(timeout=2.0)
                 # Drain any remaining signals
                 while True:
                     try:
@@ -316,28 +326,24 @@ def _job_bars_callback(job_progress, overall_task_id, total_cpus, job_queue=None
                             entry = active_jobs.pop(item_idx, None)
                             if entry:
                                 slot_pool.release(entry[0])
-                            job_progress.update(overall_task_id, advance=1)
+                            overall_progress.update(overall_task_id, advance=1)
                     except (queue_module.Empty, OSError):
                         break
                 for task_id, _ in active_jobs.values():
                     slot_pool.release(task_id)
                 active_jobs.clear()
-                job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)
+                overall_progress.update(overall_task_id, completed=overall_progress.tasks[overall_task_id].total)
+                panel.title = f"[cyan bold]Tasks ({total_tasks}/{total_tasks}) • {total_cpus} CPUs"
+                live.refresh()
     else:
         # Fallback: batch callback mode (no job_queue available)
-        completed_jobs = [0]
-
         class Callback(joblib.parallel.BatchCompletionCallBack):
             def __call__(self, *args, **kwargs):
-                job_progress.update(overall_task_id, advance=self.batch_size)
-                completed_jobs[0] += self.batch_size
+                overall_progress.update(overall_task_id, advance=self.batch_size)
                 return super().__call__(*args, **kwargs)
 
         with joblib_callback_patch(Callback):
             try:
                 yield
             finally:
-                if use_estimation:
-                    stop_est.set()
-                    est_thread.join(timeout=1.0)
-                job_progress.update(overall_task_id, completed=job_progress.tasks[overall_task_id].total)
+                overall_progress.update(overall_task_id, completed=overall_progress.tasks[overall_task_id].total)
