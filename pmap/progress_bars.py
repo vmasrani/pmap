@@ -274,7 +274,8 @@ def _start_render_loop(
                         for job_task_id, start_time in list(active_jobs.values()):
                             elapsed = now - start_time
                             pct = _dampened_progress(elapsed, ref)
-                            job_progress.start_task(job_task_id)
+                            if not job_progress._tasks[job_task_id].started:
+                                job_progress.start_task(job_task_id)
                             job_progress.update(job_task_id, total=100, completed=pct)
 
             # 3. Single render
