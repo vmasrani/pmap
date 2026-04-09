@@ -30,16 +30,8 @@ from .progress_styles import (
     make_job_description,
 )
 
-# Progress bar refresh rate (Hz) — used for simple bar; job bars use dynamic rate
-REFRESH_RATE = 8
+REFRESH_RATE = 15
 MAX_VISIBLE_BARS = 20
-
-
-def _compute_refresh_rate(total_cpus: int) -> float:
-    """Lower refresh rate for many bars to reduce terminal I/O."""
-    if total_cpus <= 8:
-        return 8
-    return 6 if total_cpus <= 16 else 4
 
 
 class _SlotPool:
@@ -169,7 +161,7 @@ def run_with_job_bars(mode: ParallelMode, arr: list, n_jobs: int, batch_size, di
     )
 
     display = Group(overall_progress, panel)
-    refresh_rate = _compute_refresh_rate(visible_slots)
+    refresh_rate = REFRESH_RATE
 
     with contextlib.ExitStack() as stack:
         live = stack.enter_context(Live(display, auto_refresh=False, transient=False))
@@ -292,7 +284,7 @@ def _start_render_loop(
 
 
 @contextlib.contextmanager
-def _job_bars_callback(live, job_progress, overall_progress, overall_task_id, total_cpus, panel, total_tasks, job_queue=None, refresh_rate=4):
+def _job_bars_callback(live, job_progress, overall_progress, overall_task_id, total_cpus, panel, total_tasks, job_queue=None, refresh_rate=REFRESH_RATE):
     """Manage per-job progress bars via worker signals (or batch callback fallback)."""
     lock = threading.Lock()
     estimator = _JobTimeEstimator()

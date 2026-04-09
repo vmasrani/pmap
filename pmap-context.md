@@ -1,26 +1,36 @@
 # pmap
 > Parallel map library with Rich/tqdm progress bars, loguru integration, and notebook-compatible backends.
-`7 files | 2026-04-03`
+`8 files | 2026-04-06`
 
 | Entry | Purpose |
 |-------|---------|
-| `pyproject.toml` | Package config; entry point for deps (joblib, rich, tqdm, loguru, ipywidgets) |
-| **pmap/** | Main package — `__init__.py` is the public API; `core.py` is shared orchestration logic |
-| **demo/** | VHS tape scripts and demo `.py` files for recording GIFs of each feature |
-| **tests/** | Pytest suite + benchmark + Jupyter notebook for notebook-mode testing |
-| **screenshots/** | Static assets; not code |
+| `pmap/__init__.py` | Public API — `pmap`, `pmap_df`, `run_async`, `safe`, `is_notebook`; backend dispatch lives here |
+| `pmap/core.py` | Shared orchestration used by both backends: `prepare_parallel_mode`, `run_pmap`, joblib callback patch |
+| `pmap/progress_bars.py` | Rich backend progress bar implementations; `_SlotPool` prevents flicker by pre-allocating fixed slots |
+| `pmap/loguru_routing.py` | Strips loguru from function globals before pickling; re-injects in workers; routes `print()` and loguru through a queue to appear above progress bars |
+| `pmap/progress_styles.py` | Visual config for Rich bars (column layout, panel height, slot descriptions) |
+| `pyproject.toml` | Package metadata; runtime deps are joblib, loguru, rich, tqdm |
+| `PLAN.md` | Design notes and feature roadmap — useful context for architectural decisions |
+| **pmap/tqdm_backend/** | Alternate backend used automatically in Jupyter; same `run_pmap` core, different progress renderer |
+| **tests/** | pytest suite + notebook test; `benchmark.py` for perf comparison |
+| **benchmarks/** | Standalone benchmark scripts |
+| **demo/** | Demo scripts and screenshots |
 
 <!-- peek -->
 
 ## Conventions
-- Public API surface: `pmap`, `pmap_df`, `run_async`, `safe` — all imported from `pmap/__init__.py`.
-- `backend='auto'` selects `'tqdm'` in Jupyter (Rich Live doesn't work in notebooks) and `'rich'` in terminals. Override explicitly with `backend='tqdm'` or `backend='rich'`.
-- `core.py` is a shared orchestration layer used by BOTH backends — the Rich and tqdm backends inject their own `sequential_map_fn`, `run_simple_fn`, `run_job_bars_fn` callables into `run_pmap()` rather than subclassing.
-- In process mode (default), all stdout/print output from workers is intercepted by `LoguruStdoutRedirector` and re-emitted via loguru so it appears above the progress bar. In thread mode (`prefer='threads'`), output goes directly to stdout.
+
+- Backend is selected at call time: `backend='auto'` resolves to `'tqdm'` in notebooks (`is_notebook()` checks for `ZMQInteractiveShell`), `'rich'` otherwise. Force with `backend='rich'` or `backend='tqdm'`.
+- Both backends share `core.run_pmap` — they differ only in which `sequential_map_fn`, `run_simple_fn`, and `run_job_bars_fn` callables are passed in.
+- `prefer='threads'` skips loguru stripping/reinjection and the multiprocessing Manager entirely (no pickling needed).
+- `show_job_bars=True` forces `batch_size=1` internally to keep all worker slots visible.
+- `safe_mode=True` wraps the function with `safe()`, returning `{'error', 'error_type', 'args', 'kwargs'}` dicts instead of raising.
 
 ## Gotchas
-- Loguru is stripped from function globals before pickling (for subprocess workers) and re-injected inside each worker — functions that reference `logger` as a module-level global will have it temporarily removed. This is handled transparently by `loguru_routing.py`.
-- `pmap_df` uses `sklearn.model_selection.GroupKFold` for group-aware splitting — requires scikit-learn, which is listed as a hard dependency even for non-ML use.
-- `safe_mode=True` wraps `f` with the `safe()` decorator, which catches ALL exceptions and returns a dict `{'error': ..., 'error_type': ..., 'args': ..., 'kwargs': ...}` instead of raising. Callers must check return types.
-- `run_async` returns a `multiprocessing.Queue`, not a future — callers must call `.get()` on the queue to retrieve results.
-- joblib's `BatchCompletionCallBack` is monkey-patched via `joblib_callback_patch` context manager to enable per-job progress bars; this modifies a private joblib internal.
+
+- In process mode (default), loguru is **stripped from function globals before pickling** and reinjected in each worker. If the user function closes over a loguru logger variable, it must be imported inside the function body rather than captured from the outer scope.
+- `_SlotPool` in `progress_bars.py` pre-allocates all slots at startup and keeps them `visible=True` with `start=False`. Calling `start_task` outside the intended code path breaks the pulse animation — slots pulse only when `task.started is False`.
+- `joblib_callback_patch` monkey-patches `joblib.parallel.BatchCompletionCallBack` for the duration of the parallel call. Nested `pmap` calls will fight over this patch.
+- `pmap_df` requires `scikit-learn` (for `GroupKFold`) even when `groups=` is not used; it is a dev dependency, not a runtime one.
+- The Rich backend does not work in Jupyter — `is_notebook()` guards this, but forcing `backend='rich'` in a notebook will produce broken output.
+- `run_async` returns a `multiprocessing.Queue`, not a future — callers must call `.get()` to retrieve results.

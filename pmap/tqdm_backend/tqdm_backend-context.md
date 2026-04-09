@@ -1,21 +1,24 @@
 # tqdm_backend
 > tqdm-based progress rendering for pmap — handles terminal bars, per-job bars, and notebook display via a unified API.
-`2 files | 2026-04-03`
+`2 files | 2026-04-06`
 
 | Entry | Purpose |
 |-------|---------|
-| `__init__.py` | Thin `pmap()` entry point — wires `run_pmap` from `core` with the three renderer functions from `progress.py` |
-| `progress.py` | All rendering logic: `sequential_map`, `run_with_simple_bar`, `run_with_job_bars`, plus notebook stdout/loguru plumbing |
+| `__init__.py` | Thin `pmap()` wrapper that wires backend functions into `run_pmap` from core |
+| `progress.py` | All rendering logic: simple bar, per-job bars, notebook stdout/loguru redirection |
 
 <!-- peek -->
 
 ## Conventions
-- `run_pmap` (in `core.py`) owns all dispatch logic; this package only supplies renderer callables injected via `sequential_map_fn`, `run_simple_fn`, `run_job_bars_fn` parameters.
-- `tqdm.auto` is used throughout — it auto-selects `tqdm.notebook` or `tqdm.std` based on environment, so the same code path handles both.
-- Loguru is patched at runtime via `redirect_loguru_to_tqdm()`: it removes all handlers, adds a custom `write_fn`, then restores `sys.stderr` on exit. Any code that sets up its own loguru handlers before calling `pmap` will have those handlers removed.
+
+- `tqdm.auto` is used (not `tqdm.tqdm`) so the same code auto-selects widget vs. terminal bar in notebooks vs. terminals.
+- `run_with_job_bars` falls back to `run_with_simple_bar` when running in a notebook — per-job bars require terminal cursor control that doesn't work in Jupyter.
+- loguru is redirected at runtime via `logger.remove()` + `logger.add(write_fn)` so tqdm bars aren't broken by loguru output. The original stderr handler is restored in `finally`. If loguru is not installed, this is silently skipped.
+- Thread-backend jobs redirect `sys.stdout` through `NotebookStdoutRedirector` (thread-local buffers) to prevent interleaving. Process-backend jobs skip this (separate processes have separate stdout).
 
 ## Gotchas
-- `run_with_job_bars` silently falls back to `run_with_simple_bar` in notebooks — per-job bars rely on ANSI cursor positioning which Jupyter does not support.
-- `NotebookStdoutRedirector` uses thread-local buffers to prevent interleaving from concurrent joblib threads, but it bypasses loguru entirely to avoid re-entrancy deadlocks — log messages in notebooks go through this redirector, not through loguru's normal pipeline.
-- The `log_consumer_tqdm` context manager spawns a daemon thread to drain a log queue (used in process-parallel mode). If the consumer thread doesn't drain within 1 second on exit, remaining messages are silently dropped.
-- `run_with_job_bars` prints `'\n' * total_cpus` in the `finally` block to clear tqdm's position-indexed bars — this is a side effect visible in terminal output after every parallel call with `show_job_bars=True`.
+
+- `redirect_loguru_to_tqdm` uses a mutable list `pbar_ref = [None]` as a closure workaround — the pbar is assigned after the context manager yields, so the write function must read it lazily via the list.
+- `run_with_job_bars` in signal-driven mode prints `'\n' * total_cpus` after completion to clear the per-job bar slots — skipping or double-calling this will corrupt the terminal.
+- `log_consumer_tqdm` drains the queue after `stop_event` fires to avoid dropping late log messages; the drain loop must handle `queue.Empty` explicitly.
+- `NotebookStdoutRedirector.write` writes directly to the real stdout (bypassing loguru) to avoid re-entrancy deadlocks with loguru's internal lock.
